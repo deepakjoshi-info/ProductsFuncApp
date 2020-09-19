@@ -1,96 +1,104 @@
-using System.IO;
-using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.Cosmos.Table;
+using Microsoft.Azure.Storage;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
-using System.Collections.Generic;
+using ProductsFuncApp.Model;
+using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace ProductsFuncApp
 {
-    public class ProductModel
-    {
-        public string Id { get; set; }
-        public string Name { get; set; }
-        public decimal Price { get; set; }
-        public int Stock { get; set; }
-    }
+
     public static class Product
     {
-        static List<ProductModel> products = new List<ProductModel>();
-        static Product()
-        {
-            products.Add(new ProductModel()
-            {
-                Id = "1",
-                Name = "Mobile",
-                Price = 100m,
-                Stock = 10
-            });
-            products.Add(new ProductModel()
-            {
-                Id = "2",
-                Name = "HDD",
-                Price = 100m,
-                Stock = 10
-            });
-            products.Add(new ProductModel()
-            {
-                Id = "3",
-                Name = "TVs",
-                Price = 100m,
-                Stock = 10
-            });
-        }
 
+        private const string Route = "Product";
+        private const string TableName = "products";
         [FunctionName("GetProduct")]
         public static async Task<IActionResult> GetProduct(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "Product")] HttpRequest req,
-            ILogger log)
+           [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = Route)] HttpRequest req,
+           [Table(TableName, Connection = "AzureWebJobsStorage")] CloudTable productTable,
+           ILogger log)
         {
-            log.LogInformation("Getting product list.");
-            return new OkObjectResult(products);
+            log.LogInformation("Getting product list");
+            var query = new TableQuery<ProductEntity>();
+            var segment = await productTable.ExecuteQuerySegmentedAsync(query, null);
+            return new OkObjectResult(segment.Select(Mappings.ToProductModel));
         }
 
         [FunctionName("GetProductbyId")]
-        public static async Task<IActionResult> GetProductbyId(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "Product/{id}")] HttpRequest req,
+        public static IActionResult GetProductbyId(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = Route + "/{id}")] HttpRequest req,
+            [Table(TableName, "PRODUCT", "{id}", Connection = "AzureWebJobsStorage")] ProductEntity productTable,
             ILogger log, string id)
         {
             log.LogInformation("Getting product by id");
-            var product = products.FirstOrDefault(t => t.Id == id);
-            if (product == null)
+            if (productTable == null)
             {
+                log.LogInformation($"Product {id} not found");
                 return new NotFoundResult();
             }
-            return new OkObjectResult(product);
+            return new OkObjectResult(productTable.ToProductModel());
         }
-        
+
         [FunctionName("AddProduct")]
         public static async Task<IActionResult> AddProduct(
-    [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "Product")] HttpRequest req, ILogger log)
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = Route)] HttpRequest req,
+            [Table(TableName, Connection = "AzureWebJobsStorage")] IAsyncCollector<ProductEntity> productTable,
+            ILogger log)
         {
-            log.LogInformation("Adding a new product in list");
+            log.LogInformation("Adding product in table.");
             string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
-            var product = JsonConvert.DeserializeObject<ProductModel>(requestBody);
-            products.Add(product);
+            var input = JsonConvert.DeserializeObject<ProductModel>(requestBody);
+            var product = Mappings.ToTableEntity(input);
+            await productTable.AddAsync(product);
             return new OkObjectResult(product);
         }
-        
-        [FunctionName("DeleteProduct")]
-        public static IActionResult DeleteProduct(
-    [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "Product/{id}")] HttpRequest req,
-    ILogger log, string id)
+
+       
+
+        [FunctionName("UpdateProduct")]
+        public static async Task<IActionResult> UpdateProduct(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "put", Route = Route + "/{id}")] HttpRequest req,
+            [Table(TableName, Connection = "AzureWebJobsStorage")] CloudTable productTable,
+            ILogger log, string id)
         {
-            var product = products.FirstOrDefault(t => t.Id == id);
-            if (product == null)
+
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            var updated = JsonConvert.DeserializeObject<ProductModel>(requestBody);
+            var findOperation = TableOperation.Retrieve<ProductEntity>("PRODUCT", id);
+            var findResult = await productTable.ExecuteAsync(findOperation);
+            if (findResult.Result == null)
             {
                 return new NotFoundResult();
             }
-            products.Remove(product);
+            var existingRow = (ProductEntity)findResult.Result;
+            var replaceOperation = TableOperation.Replace(existingRow);
+            await productTable.ExecuteAsync(replaceOperation);
+            return new OkObjectResult(existingRow.ToProductModel());
+        }
+
+        [FunctionName("DeleteProduct")]
+        public static async Task<IActionResult> DeleteProduct(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = Route + "/{id}")] HttpRequest req,
+            [Table(TableName, Connection = "AzureWebJobsStorage")] CloudTable productTable,
+            ILogger log, string id)
+        {
+            var deleteEntity = new TableEntity { PartitionKey = "PRODUCT", RowKey = id, ETag = "*" };
+            var deleteOperation = TableOperation.Delete(deleteEntity);
+            try
+            {
+                await productTable.ExecuteAsync(deleteOperation);
+            }
+            catch (Microsoft.Azure.Cosmos.Table.StorageException e) when (e.RequestInformation.HttpStatusCode == 404)
+            {
+                return new NotFoundResult();
+            }
             return new OkResult();
         }
     }
